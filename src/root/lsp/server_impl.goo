@@ -1,0 +1,461 @@
+// Contains the implementation of a LSP server.
+
+package lsp
+
+import (
+	"container/list"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"root/lspnet"
+	"os"
+	"strconv"
+	"time"
+)
+
+type server struct {
+	udpConn      *lspnet.UDPConn
+	recvChan     chan *addrAndMsg
+	sendChan     chan *sendPack
+	mapping      map[string]*clientMapValue
+	mappingID    map[int]*lspnet.UDPAddr
+	nextConnID   int
+	tickChan     *time.Ticker
+	readNotice   chan bool
+	readBack     chan *sendPack
+	readCount    int
+	closeChan    chan int
+	closeAllChan chan bool
+}
+
+type clientMapValue struct {
+	connID         int
+	recvDataList   *list.List
+	allRecvDataMap map[int]*Message
+	readUpTo       int
+	readFrom       int
+	sendDataList   *list.List
+	sendDataSeq    int
+	tickCounts     int
+	closed         bool
+	timeOut        bool
+}
+
+type sendPack struct {
+	connID  int
+	payload []byte
+}
+
+type addrAndMsg struct {
+	addr *lspnet.UDPAddr
+	msg  *Message
+}
+
+// NewServer creates, initiates, and returns a new server. This function should
+// NOT block. Instead, it should spawn one or more goroutines (to handle things
+// like accepting incoming client connections, triggering epoch events at
+// fixed intervals, synchronizing events using a for-select loop like you saw in
+// project 0, etc.) and immediately return. It should return a non-nil error if
+// there was an error resolving or listening on the specified port number.
+func NewServer(port int, params *Params) (Server, error) {
+	serv := new(server)
+	serv.recvChan = make(chan *addrAndMsg)
+	serv.sendChan = make(chan *sendPack)
+	serv.readCount = 0
+	serv.readNotice = make(chan bool)
+	serv.readBack = make(chan *sendPack)
+	serv.closeAllChan = make(chan bool)
+	serv.closeChan = make(chan int)
+	serv.nextConnID = 1
+	serv.mapping = make(map[string]*clientMapValue)
+	serv.mappingID = make(map[int]*lspnet.UDPAddr)
+	serv.tickChan = time.NewTicker(time.Millisecond * time.Duration(params.EpochMillis))
+
+	//resolve UDP address
+	hostPortStr := lspnet.JoinHostPort("localhost", strconv.Itoa(port))
+	udpAddr, err := lspnet.ResolveUDPAddr("udp", hostPortStr)
+
+	if checkError(err) {
+		return nil, err
+	}
+	//fmt.Println("udpAddr = ", udpAddr)
+
+	//dialUDP
+	udpConn, err := lspnet.ListenUDP("udp", udpAddr)
+	if checkError(err) {
+		return nil, err
+	}
+	serv.udpConn = udpConn
+	go serverEventHandler(serv, params)
+	go readFromConnections(serv, params)
+
+	return serv, nil
+}
+
+func readFromConnections(serv *server, params *Params) {
+	for {
+		var recvMsg *Message
+		var buf [1500]byte
+		length, addr, err := serv.udpConn.ReadFromUDP(buf[0:])
+		if checkError(err) {
+			serv.recvChan <- nil
+		}
+
+		//parses data from connection
+		err = json.Unmarshal(buf[0:length], &recvMsg)
+		if checkError(err) {
+			serv.recvChan <- nil
+		}
+		pack := new(addrAndMsg)
+		pack.addr = addr
+		pack.msg = recvMsg
+		serv.recvChan <- pack
+	}
+}
+
+func serverEventHandler(serv *server, params *Params) {
+	for {
+		select {
+		case connID := <-serv.closeChan:
+			(serv.mapping[(serv.mappingID[connID]).String()]).closed = true
+		case <-serv.closeAllChan:
+			for _, clt := range serv.mapping {
+				clt.closed = true
+			}
+
+		case recvAddrAndMsg := <-serv.recvChan:
+			//fmt.Println("Server Received ", recvAddrAndMsg.msg)
+			if recvAddrAndMsg == nil {
+				fmt.Println("Error Reading from Server")
+				os.Exit(1)
+			}
+			switch recvAddrAndMsg.msg.Type {
+			case MsgConnect:
+
+				found := false
+				//fmt.Println("recvAddrAndMsg.addr=", recvAddrAndMsg.addr.String())
+				//fmt.Println("mapping len =", len(serv.mapping))
+
+				for key, value := range serv.mapping {
+					//fmt.Println("Key:", key, "Value:", &value)
+					_ = value
+					if key == recvAddrAndMsg.addr.String() {
+						found = true
+						break
+					}
+				}
+				if !found {
+					//fmt.Println("non existing connection")
+					cltVal := new(clientMapValue)
+					//////////////////////////////////////
+					//initialize all clientMapValue values
+					///////////////////////////////////////
+					cltVal.connID = serv.nextConnID
+					cltVal.allRecvDataMap = make(map[int]*Message)
+					cltVal.recvDataList = list.New()
+					cltVal.tickCounts = 0
+					cltVal.readUpTo = 0
+					cltVal.readFrom = 1
+					cltVal.closed = false
+					cltVal.timeOut = false
+					cltVal.sendDataList = list.New()
+					serv.mappingID[serv.nextConnID] = recvAddrAndMsg.addr
+					serv.mapping[recvAddrAndMsg.addr.String()] = cltVal
+					//send ack to the client for connection
+					newAckMsg := NewAck(serv.nextConnID, 0)
+					jsonNewAckMsg, err := json.Marshal(newAckMsg)
+					if err != nil {
+						fmt.Println("Error marshalling ack msg before sending to client")
+					}
+					length, _ := serv.udpConn.WriteToUDP(jsonNewAckMsg, recvAddrAndMsg.addr)
+					//ifnore write err msgs
+					//fmt.Println("Wrote Ack to", recvAddrAndMsg.addr.String())
+					_ = length
+					serv.nextConnID += 1
+				}
+			case MsgData:
+				//fmt.Println("Received MsgData:", recvAddrAndMsg.msg)
+				dataExists := false
+				cltMapVal := serv.mapping[recvAddrAndMsg.addr.String()]
+				if cltMapVal == nil {
+					fmt.Println("Received data before connection established")
+				} else {
+					if !cltMapVal.timeOut {
+						//found the corresponding client
+						cltMapVal.tickCounts = 0
+						if cltMapVal.recvDataList.Front() != nil {
+							for e := cltMapVal.recvDataList.Front(); e != nil; e = e.Next() {
+								if e.Value.(*Message).SeqNum == recvAddrAndMsg.msg.SeqNum {
+									dataExists = true
+									break
+								}
+							}
+						}
+						if !dataExists {
+							if cltMapVal.recvDataList.Len() >= params.WindowSize {
+								cltMapVal.recvDataList.Remove(cltMapVal.recvDataList.Front())
+							}
+
+							cltMapVal.recvDataList.PushBack(recvAddrAndMsg.msg)
+							cltMapVal.allRecvDataMap[recvAddrAndMsg.msg.SeqNum] = recvAddrAndMsg.msg
+							if recvAddrAndMsg.msg.SeqNum == (cltMapVal.readUpTo + 1) {
+								cltMapVal.readUpTo += 1
+								for cltMapVal.allRecvDataMap[cltMapVal.readUpTo+1] != nil {
+									cltMapVal.readUpTo += 1
+								}
+							}
+
+						}
+						//fmt.Println("recvDataList has ", cltMapVal.recvDataList.Len())
+						//fmt.Println("recvDataList has ", cltMapVal.recvDataList.Front().Value.(*Message))
+						newAckMsg := NewAck(cltMapVal.connID, recvAddrAndMsg.msg.SeqNum)
+						jsonNewAckMsg, err := json.Marshal(newAckMsg)
+						if err != nil {
+							fmt.Println("Error marshalling ack msg before sending to client")
+						}
+
+						length, _ := serv.udpConn.WriteToUDP(jsonNewAckMsg, recvAddrAndMsg.addr)
+						//ifnore write err msgs
+						//fmt.Println("Wrote Ack to", recvAddrAndMsg.addr.String(), newAckMsg)
+						_ = length
+
+						if (serv.readCount > 0) && !dataExists {
+							//fmt.Println(clt.allRecvDataList.Front().Value.(*Message))
+							for _, clt := range serv.mapping {
+								if !clt.closed {
+									if clt.allRecvDataMap[clt.readFrom] != nil {
+										pack := new(sendPack)
+										pack.payload = clt.allRecvDataMap[clt.readFrom].Payload
+										pack.connID = clt.allRecvDataMap[clt.readFrom].ConnID
+										serv.readBack <- pack
+										clt.readFrom += 1
+										serv.readCount -= 1
+									}
+								} else {
+									if clt.allRecvDataMap != nil {
+										pack := new(sendPack)
+										pack.payload = nil
+										pack.connID = (clt.allRecvDataMap[clt.readFrom]).ConnID
+										serv.readBack <- pack
+										clt.allRecvDataMap = nil
+										serv.readCount -= 1
+									}
+								}
+								if serv.readCount <= 0 {
+									break
+								}
+							}
+						}
+					}
+				}
+
+			case MsgAck:
+				cltMapVal := serv.mapping[recvAddrAndMsg.addr.String()]
+				if cltMapVal == nil {
+					//fmt.Println("Received ack before connection established")
+				} else {
+					if cltMapVal.sendDataList.Front() == nil {
+						cltMapVal.tickCounts = 0
+						//fmt.Println("Received ack but sendDataList is empty")
+					} else {
+						if !cltMapVal.timeOut {
+							cltMapVal.tickCounts = 0
+							forDebug := false
+							//find acked msg from sendDataList and remove it
+							for e := cltMapVal.sendDataList.Front(); e != nil; e = e.Next() {
+								// do something with e.Value
+								if e.Value.(*Message).SeqNum == recvAddrAndMsg.msg.SeqNum {
+									cltMapVal.sendDataList.Remove(e)
+
+									///////if acked, resend all data in window
+									for e := cltMapVal.sendDataList.Front(); e != nil; e = e.Next() {
+										msg := e.Value.(*Message)
+										if msg.SeqNum >= (cltMapVal.sendDataList.Front().Value.(*Message).SeqNum + params.WindowSize) {
+											break
+										}
+										jsonMsg, err := json.Marshal(msg)
+										if err != nil {
+											fmt.Println("Error marshalling data msg before sending to client in ticker")
+										}
+										length, _ := serv.udpConn.WriteToUDP(jsonMsg, serv.mappingID[cltMapVal.connID])
+										_ = length
+										//fmt.Println("sent data msg", msg, "to", clt.connID)
+									}
+									forDebug = true
+									break
+								}
+							}
+							if !forDebug {
+								//fmt.Println("Received ack but sendDataList doesn't have the matching data")
+							}
+						}
+					}
+				}
+			default:
+				fmt.Println("Received Message type corrupted")
+				os.Exit(1)
+
+			}
+		case pack := <-serv.sendChan:
+			connID := pack.connID
+			payload := pack.payload
+
+			addr := serv.mappingID[connID]
+			clt := serv.mapping[addr.String()]
+			if !clt.closed {
+				clt.sendDataSeq = clt.sendDataSeq + 1
+				newDataMsg := NewData(connID, clt.sendDataSeq,len(payload), payload)
+				clt.sendDataList.PushBack(newDataMsg)
+
+				if (clt.sendDataList.Front().Value.(*Message).SeqNum + params.WindowSize) > clt.sendDataSeq {
+					jsonNewDataMsg, err := json.Marshal(newDataMsg)
+					if err != nil {
+						fmt.Println("Error marshalling data msg before sending to client")
+					}
+					//fmt.Println("Server Write    ", newDataMsg)
+					length, _ := serv.udpConn.WriteToUDP(jsonNewDataMsg, addr)
+					_ = length
+					//fmt.Println("sent data msg", newDataMsg, "to", connID)
+				}
+			}
+		case gotRead := <-serv.readNotice:
+			_ = gotRead
+			finishedRead := false
+			for _, clt := range serv.mapping {
+				if !clt.closed {
+					if clt.allRecvDataMap[clt.readFrom] != nil {
+						pack := new(sendPack)
+						pack.payload = (clt.allRecvDataMap[clt.readFrom]).Payload
+						pack.connID = (clt.allRecvDataMap[clt.readFrom]).ConnID
+						serv.readBack <- pack
+						clt.readFrom += 1
+						finishedRead = true
+						break
+					}
+				} else {
+					if clt.allRecvDataMap != nil {
+						//notify Read that one of the connections is closed()
+						pack := new(sendPack)
+						pack.payload = nil
+						pack.connID = (clt.allRecvDataMap[clt.readFrom]).ConnID
+						serv.readBack <- pack
+						finishedRead = true
+						clt.allRecvDataMap = nil
+						break
+					}
+				}
+			}
+			if !finishedRead {
+				serv.readCount += 1
+			}
+
+		case <-serv.tickChan.C:
+			//fmt.Println("ticker Ticked!")
+			numberOfTimedOut := 0
+			for addrStr, clt := range serv.mapping {
+				if clt.tickCounts >= params.EpochLimit {
+					//fmt.Println("Server reach Epoch Limit with client", clt.connID)
+					//fmt.Println("Timeout")
+					clt.timeOut = true
+					numberOfTimedOut += 1
+
+				} else {
+					//perform all the epoch tasks for each client
+					_ = addrStr
+					elem := clt.recvDataList.Front()
+					////////////////
+					//sending acks
+					////////////////
+					if elem == nil {
+						//before server gets any data, send ack of seqnum=0
+						msg := NewAck(clt.connID, 0)
+						jsonMsg, err := json.Marshal(msg)
+						if err != nil {
+							fmt.Println("Error marshalling 0th ack msg")
+						}
+						//fmt.Println("Server Write    ", msg)
+						length, _ := serv.udpConn.WriteToUDP(jsonMsg, serv.mappingID[clt.connID])
+						_ = length
+					} else {
+						for elem = clt.recvDataList.Front(); elem != nil; elem = elem.Next() {
+							if !clt.closed {
+								msg := NewAck(clt.connID, elem.Value.(*Message).SeqNum)
+								jsonMsg, err := json.Marshal(msg)
+								if err != nil {
+									fmt.Println("Error marshalling ack msg before sending to client")
+								}
+								//fmt.Println("Server Write    ", msg)
+								length, _ := serv.udpConn.WriteToUDP(jsonMsg, serv.mappingID[clt.connID])
+								//ignore write err msgs
+								_ = length
+								//fmt.Println("sent ack msg ", msg)
+							}
+						}
+					}
+					////////////////
+					//sending datas
+					////////////////
+					for e := clt.sendDataList.Front(); e != nil; e = e.Next() {
+						msg := e.Value.(*Message)
+						if msg.SeqNum >= (clt.sendDataList.Front().Value.(*Message).SeqNum + params.WindowSize) {
+							break
+						}
+						jsonMsg, err := json.Marshal(msg)
+						if err != nil {
+							fmt.Println("Error marshalling data msg before sending to client in ticker")
+						}
+						//fmt.Println("Server Write    ", msg)
+						length, _ := serv.udpConn.WriteToUDP(jsonMsg, serv.mappingID[clt.connID])
+						_ = length
+						//fmt.Println("sent data msg", msg, "to", clt.connID)
+					}
+					clt.tickCounts += 1
+				}
+
+			}
+			if numberOfTimedOut == len(serv.mapping) {
+				pack := new(sendPack)
+				pack.connID = 0
+				pack.payload = nil
+				serv.readBack <- pack
+			}
+
+		}
+	}
+}
+
+func (s *server) Read() (int, []byte, error) {
+	// TODO: remove this line when you are ready to begin implementing this method.
+	//fmt.Println("Server called Read")
+	s.readNotice <- true
+	pack := <-s.readBack
+	//fmt.Println("Server called Readend")
+	if pack.payload == nil {
+		return pack.connID, nil, errors.New("Nothing to read from")
+	} else {
+		return pack.connID, pack.payload, nil
+	}
+}
+
+func (s *server) Write(connID int, payload []byte) error {
+	//fmt.Println("Server called Write")
+	pack := new(sendPack)
+	pack.connID = connID
+	pack.payload = payload
+	//fmt.Println("pack.connID = ", pack.connID, "pack.payload=", pack.payload)
+	s.sendChan <- pack
+	//fmt.Println("Server called Writeend")
+	return nil
+	//return errors.New("not yet implemented")
+}
+
+func (s *server) CloseConn(connID int) error {
+	s.closeChan <- connID
+	return nil
+}
+
+func (s *server) Close() error {
+	s.closeAllChan <- true
+	//s.serverClosed <- true
+	return nil
+}

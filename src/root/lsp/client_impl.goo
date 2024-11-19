@@ -1,0 +1,422 @@
+// Contains the implementation of a LSP client.
+
+package lsp
+
+import (
+	"container/list"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"root/lspnet"
+	"os"
+	"time"
+)
+
+type client struct {
+	udpConn             *lspnet.UDPConn
+	connID              int
+	tickChan            *time.Ticker
+	recvDataList        *list.List
+	sendDataList        *list.List
+	allRecvDataMap      map[int]*Message
+	sendDataSeq         int
+	sendDataChan        chan []byte
+	connectionLost      bool
+	tickCounts          int
+	readNotice          chan bool
+	readBack            chan *Message
+	readCount           int
+	recvChan            chan *Message
+	readFrom            int
+	closeChan           chan bool
+	closed              bool
+	timeOut             bool
+	closeNetWorkHandler chan bool
+}
+
+// NewClient creates, initiates, and returns a new client. This function
+// should return after a connection with the server has been established
+// (i.e., the client has received an Ack message from the server in response
+// to its connection request), and should return a non-nil error if a
+// connection could not be made (i.e., if after K epochs, the client still
+// hasn't received an Ack message from the server in response to its K
+// connection requests).
+//
+// hostport is a colon-separated string identifying the server's host address
+// and port number (i.e., "localhost:9999").
+func NewClient(hostport string, params *Params) (Client, error) {
+	clt := new(client)
+	clt.recvDataList = list.New()
+	clt.sendDataList = list.New()
+	clt.readFrom = 1
+	clt.allRecvDataMap = make(map[int]*Message)
+	clt.sendDataSeq = 0
+	count := 0
+	//resolve UDP address
+	udpAddr, err := lspnet.ResolveUDPAddr("udp", hostport)
+	if checkError(err) {
+		return nil, err
+	}
+	//fmt.Println(udpAddr, err)
+
+	//dialUDP
+	udpConn, err := lspnet.DialUDP("udp", nil, udpAddr)
+	if checkError(err) {
+		return nil, err
+	}
+	clt.udpConn = udpConn
+	//fmt.Println(clt.udpConn)
+
+	//make request
+	connMsg := NewConnect()
+	jsonConnMsg, err := json.Marshal(connMsg)
+
+	//send request
+	//length, err := clt.udpConn.Write(jsonConnMsg)
+	clt.udpConn.Write(jsonConnMsg)
+
+
+
+	//fmt.Println("connMsg =", connMsg)
+	//fmt.Println("sent length of ", length)
+
+	//start timer
+	clt.tickChan = time.NewTicker(time.Millisecond * time.Duration(params.EpochMillis))
+	connectChan := make(chan *Message)
+	go connectRecv(connectChan, clt)
+
+	for {
+		select {
+		case recvMsg := <-connectChan:
+			if recvMsg == nil {
+
+			} else {
+				clt.connID = recvMsg.ConnID
+
+				clt.sendDataChan = make(chan []byte)
+				clt.recvChan = make(chan *Message)
+				clt.readNotice = make(chan bool)
+				clt.readBack = make(chan *Message)
+				clt.closeChan = make(chan bool)
+				clt.closeNetWorkHandler = make(chan bool)
+				clt.readCount = 0
+				clt.timeOut = false
+				clt.closed = false
+				go networkHandler(clt)
+				go clientEventHandler(clt, params)
+				return clt, nil
+			}
+		case <-clt.tickChan.C:
+			if count <= params.EpochLimit {
+				length, err := clt.udpConn.Write(jsonConnMsg)
+				if checkError(err) {
+					return nil, err
+				}
+				_ = length
+
+				count += 1
+			} else {
+				return nil, errors.New("Reach Epoch limit")
+			}
+		}
+	}
+}
+
+func clientEventHandler(clt *client, params *Params) {
+
+	for {
+		select {
+		case <-clt.closeChan:
+			clt.closed = true
+			//fmt.Println("connID:", clt.connID)
+		case sendDataMsg := <-clt.sendDataChan:
+			if !clt.closed {
+				//when write is called and writes data the first time
+				clt.sendDataSeq = clt.sendDataSeq + 1
+				newDataMsg := NewData(clt.connID, clt.sendDataSeq, len(sendDataMsg),sendDataMsg)
+				clt.sendDataList.PushBack(newDataMsg)
+
+				if (clt.sendDataList.Front().Value.(*Message).SeqNum + params.WindowSize) > clt.sendDataSeq {
+					//if in windowsize then send it
+					jsonNewDataMsg, err := json.Marshal(newDataMsg)
+					if err != nil {
+					}
+					length, _ := clt.udpConn.Write(jsonNewDataMsg)
+					//ignore write err msgs
+					_ = length
+				}
+			}
+
+		case recvMsg := <-clt.recvChan:
+			if !clt.timeOut {
+				clt.tickCounts = 0
+				//fmt.Println("received message", recvMsg)
+				// all read cases
+				if recvMsg == nil {
+					fmt.Println("Error Reading from Server")
+					os.Exit(1)
+				}
+				switch recvMsg.Type {
+				case MsgAck:
+					//todo After Write
+					if clt.sendDataList.Front() == nil {
+						//fmt.Println("received ack but sendDataList is empty")
+
+					} else {
+						forDebug := false
+						//find acked msg from sendDataList and remove it
+						for e := clt.sendDataList.Front(); e != nil; e = e.Next() {
+							// do something with e.Value
+							if e.Value.(*Message).SeqNum == recvMsg.SeqNum {
+								clt.sendDataList.Remove(e)
+
+								//if acked, resend all data in window
+								for e := clt.sendDataList.Front(); e != nil; e = e.Next() {
+									msg := e.Value.(*Message)
+									if msg.SeqNum >= (clt.sendDataList.Front().Value.(*Message).SeqNum + params.WindowSize) {
+										//stop sending if exceed windowsize
+										break
+									}
+									jsonMsg, err := json.Marshal(msg)
+									if err != nil {
+										fmt.Println("Error marshalling data msg before sending to server")
+									}
+									length, _ := clt.udpConn.Write(jsonMsg)
+									//ignore write err msgs
+									_ = length
+
+								}
+
+								forDebug = true
+								break
+							}
+						}
+
+						if !forDebug {
+							//fmt.Println("received ack but sendDataList doesn't have the matching data")
+						}
+					}
+
+				case MsgData:
+					//received data, add to linked list
+					dataExists := false
+					if clt.recvDataList.Front() != nil {
+						for e := clt.recvDataList.Front(); e != nil; e = e.Next() {
+							// do something with e.Value
+							if e.Value.(*Message).SeqNum == recvMsg.SeqNum {
+								dataExists = true
+								break
+							}
+						}
+					}
+					if !dataExists {
+						if clt.recvDataList.Len() >= params.WindowSize {
+							clt.recvDataList.Remove(clt.recvDataList.Front())
+						}
+						clt.recvDataList.PushBack(recvMsg)
+						clt.allRecvDataMap[recvMsg.SeqNum] = recvMsg
+					}
+					newAckMsg := NewAck(clt.connID, recvMsg.SeqNum)
+					jsonNewAckMsg, err := json.Marshal(newAckMsg)
+					if err != nil {
+						fmt.Println("Error marshalling ack msg before sending to client")
+					}
+					length, _ := clt.udpConn.Write(jsonNewAckMsg)
+					//ifnore write err msgs
+					_ = length
+
+					//received new data and send back to read
+					for (clt.readCount > 0) && !dataExists {
+						if !clt.closed {
+							//only do this when connection is not Closed()
+							if clt.allRecvDataMap[clt.readFrom] != nil {
+								clt.readBack <- clt.allRecvDataMap[clt.readFrom]
+								clt.readFrom += 1
+								clt.readCount -= 1
+							} else {
+								break
+							}
+						} else {
+							//if connection already closed just return nil
+							clt.readBack <- nil
+						}
+					}
+
+				default:
+					fmt.Println("received Message type corrupted")
+					os.Exit(1)
+				}
+			}
+		case gotRead := <-clt.readNotice:
+			if !clt.closed {
+				_ = gotRead
+				if clt.allRecvDataMap[clt.readFrom] != nil {
+					clt.readBack <- clt.allRecvDataMap[clt.readFrom]
+					clt.readFrom += 1
+				} else {
+					clt.readCount += 1
+				}
+			} else {
+				clt.readBack <- nil
+			}
+
+		case <-clt.tickChan.C:
+
+			if clt.tickCounts >= params.EpochLimit {
+				clt.timeOut = true
+				clt.readBack <- nil
+			} else {
+				//perform epoch fired tasks
+
+				//resend all data messages that haven't been acked
+				/////////////////////////
+				//////////change to fit windowsize
+				//////////////////////////
+				for e := clt.sendDataList.Front(); e != nil; e = e.Next() {
+					msg := e.Value.(*Message)
+					if msg.SeqNum >= (clt.sendDataList.Front().Value.(*Message).SeqNum + params.WindowSize) {
+						//stop sending if exceed windowsize
+						break
+					}
+					jsonMsg, err := json.Marshal(msg)
+					if err != nil {
+						fmt.Println("Error marshalling data msg before sending to server")
+					}
+					length, _ := clt.udpConn.Write(jsonMsg)
+					//ignore write err msgs
+					_ = length
+					//fmt.Println("sent data msg ", msg)
+
+				}
+				//resend all ack messages for the last w data messages that were received
+				elem := clt.recvDataList.Front()
+				if elem == nil {
+					//if didn't receive any data, send ack of seqnum = 0
+					msg := NewAck(clt.connID, 0)
+					jsonMsg, err := json.Marshal(msg)
+					if err != nil {
+						fmt.Println("Error marshalling 0th ack msg")
+					}
+					length, _ := clt.udpConn.Write(jsonMsg)
+					_ = length
+				} else {
+					for elem = clt.recvDataList.Front(); elem != nil; elem = elem.Next() {
+						msg := NewAck(clt.connID, elem.Value.(*Message).SeqNum)
+						jsonMsg, err := json.Marshal(msg)
+						if err != nil {
+							fmt.Println("Error marshalling ack msg before sending to client")
+						}
+
+						length, _ := clt.udpConn.Write(jsonMsg)
+						//ignore write err msgs
+						_ = length
+
+					}
+
+				}
+				clt.tickCounts += 1
+
+			}
+		}
+	}
+}
+
+func networkHandler(clt *client) {
+	//Read blocking
+	for {
+		var recvMsg Message
+		var buf [1500]byte
+		length, err := clt.udpConn.Read(buf[0:])
+		if err != nil {
+			fmt.Print("Client cannot connect to server")
+			clt.recvChan <- nil
+		}
+
+		//parses data from connection
+		err = json.Unmarshal(buf[0:length], &recvMsg)
+		if err != nil {
+			fmt.Print("Client cannot connect to server")
+			clt.recvChan <- nil
+		}
+
+		clt.recvChan <- &recvMsg
+		select {
+		case <-clt.closeNetWorkHandler:
+			break
+		default:
+
+		}
+
+	}
+}
+
+//return true if error
+func checkError(err error) bool {
+	if err != nil {
+		fmt.Fprintf(os.Stderr, err.Error())
+		return true
+	}
+	return false
+}
+
+func connectRecv(connectChan chan *Message, clt *client) {
+	//Read blocking
+	for {
+		var recvMsg Message
+		var buf [1500]byte
+		//fmt.Println("Reading...")
+		length, err := clt.udpConn.Read(buf[0:])
+		if checkError(err) {
+			connectChan <- nil
+		}
+
+		//parses data from connection
+		err = json.Unmarshal(buf[0:length], &recvMsg)
+		if checkError(err) {
+			connectChan <- nil
+		}
+
+		if recvMsg.Type == MsgAck && recvMsg.SeqNum == 0 {
+			//fmt.Println("Received ACK")
+			connectChan <- &recvMsg
+			break
+		} else {
+			//fmt.Println("Received other messages before ACK")
+		}
+
+	}
+}
+
+func (c *client) ConnID() int {
+
+	return c.connID
+}
+
+//read only reads data messages
+func (c *client) Read() ([]byte, error) {
+	c.readNotice <- true
+	msg := <-c.readBack
+
+	if msg != nil {
+		return msg.Payload, nil
+	} else {
+		return nil, errors.New("Client TimeOut Or Closed")
+	}
+
+	//fmt.Println("CLIENT READ msg", msg)
+
+}
+
+func (c *client) Write(payload []byte) error {
+	//chan chan payload? but block
+	if c.connectionLost {
+		return errors.New("Connection Lost, couldn't write")
+	}
+	c.sendDataChan <- payload
+	return nil
+}
+
+func (c *client) Close() error {
+	c.closeChan <- true
+	return nil
+}
